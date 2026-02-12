@@ -1,0 +1,40 @@
+[project]
+name = "rmq"
+version = "1.0.0"
+description = "Async RabbitMQ consumer and producer with correct ack/nack, prefetch, gracefull shutdown"
+authors = [
+    { name = "Daniil", email = "daniilzubrik@gmail.com" }
+]
+requires-python = ">=3.13.5"
+dependencies = [
+    "aio-pika==9.5.8",
+    "python-decouple==3.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black==26.1.0",
+    "isort==5.13.2",
+    "flake8==7.3.0",
+    "mypy==1.15.0",
+    "pylint==3.3.2",
+    "pre-commit==4.5.1"
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py313"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+known_first_party = ["config", "consumer"]
+known_third_party = ["aio_pika", "decouple"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+
+[[tool.mypy.overrides]]
+module = ["aio_pika.*", "decouple"]
+ignore_missing_imports = true
