@@ -1,9 +1,13 @@
 import asyncio
+import sys
+from pathlib import Path
 
 import aio_pika
 import aio_pika.abc
 
-from .config import get_connection
+from async_consumer.config import get_connection
+
+sys.path.insert(0, str(Path(__file__).parent))
 
 
 class Publisher:

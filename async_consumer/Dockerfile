@@ -7,7 +7,8 @@ COPY .env .
 
 RUN pip install --no-cache-dir .[dev]
 
-COPY . ./async_consumer/
+COPY . /app/async_consumer/
 
 RUN useradd --create-home --shell /bin/bash appuser && chown -R appuser:appuser /app
 USER appuser
+ENV PYTHONPATH=/app
