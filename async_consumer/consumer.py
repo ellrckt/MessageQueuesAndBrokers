@@ -16,6 +16,7 @@ from async_consumer.config import (
     RMQ_RETRY_QUEUE,
     get_connection,
 )
+from async_consumer.tracer import Span, Tracer
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -46,6 +47,7 @@ class GracefullConsumer:
         self.dl_exchange: pabc.AbstractExchange
         self.retry_queue: pabc.AbstractQueue
         self.retry_exchange: pabc.AbstractExchange
+        self.tracer = Tracer("consumer-service")
 
     async def setup(self):
         """
@@ -118,35 +120,49 @@ class GracefullConsumer:
         return min(delay, self.max_delay)
 
     async def send_to_dlq(
-        self, message: pabc.AbstractIncomingMessage, reason: str, retry_count: int
+        self, message: pabc.AbstractIncomingMessage, reason: str, retry_count: int, trace_span: Span
     ):
         headers = dict(message.headers) if message.headers else {}
         headers.update(
             {
                 "x-error-reason": reason,
-                "x-error-time": datetime.now(timezone.utc).isoformat(),
+                "x-error-time": datetime.now(timezone.utc),
                 "x-original-routing-key": self.routing_key,
                 "x-final-retry-count": retry_count,
             }
         )
+        dlq_span = self.tracer.start_span(
+            "send_to_dlq",
+            incoming_traceparent=self.tracer.create_traceparent(
+                trace_span.trace_id, trace_span.span_id
+            ),
+        )
+        dlq_span.add_attribute("reason", reason)
+        dlq_span.add_attribute("retry_count", retry_count)
+
+        dlq_message = aio_pika.Message(
+            body=message.body,
+            headers=headers,
+            delivery_mode=pabc.DeliveryMode.PERSISTENT,
+            content_type=message.content_type,
+            content_encoding=message.content_encoding,
+            correlation_id=message.correlation_id,
+            reply_to=message.reply_to,
+            message_id=message.message_id,
+            timestamp=message.timestamp,
+        )
+        dlq_message = self.tracer.add_trace_context_to_message(dlq_message, dlq_span)
 
         await self.dl_exchange.publish(
-            aio_pika.Message(
-                body=message.body,
-                headers=headers,
-                delivery_mode=pabc.DeliveryMode.PERSISTENT,
-                content_type=message.content_type,
-                content_encoding=message.content_encoding,
-                correlation_id=message.correlation_id,
-                reply_to=message.reply_to,
-                message_id=message.message_id,
-                timestamp=message.timestamp,
-            ),
+            dlq_message,
             routing_key=RMQ_DL_QUEUE,
         )
+        self.tracer.end_span(dlq_span)
         print(f"Message sent to DLQ. Reason: {reason}, Retries: {retry_count}")
 
-    async def retry_message(self, message: pabc.AbstractIncomingMessage, retry_count: int):
+    async def retry_message(
+        self, message: pabc.AbstractIncomingMessage, retry_count: int, trace_span: Span
+    ):
         delay_seconds = self.calculate_backoff(retry_count)
         delay_ms = delay_seconds
 
@@ -159,22 +175,35 @@ class GracefullConsumer:
                 "x-original-routing-key": self.routing_key,
             }
         )
+        retry_span = self.tracer.start_span(
+            "schedule_retry",
+            incoming_traceparent=self.tracer.create_traceparent(
+                trace_span.trace_id, trace_span.span_id
+            ),
+        )
+        retry_span.add_attribute("retry_number", retry_count + 1)
+        retry_span.add_attribute("delay_seconds", delay_seconds)
+
+        retry_message = aio_pika.Message(
+            body=message.body,
+            headers=headers,
+            delivery_mode=pabc.DeliveryMode.PERSISTENT,
+            content_type=message.content_type,
+            content_encoding=message.content_encoding,
+            correlation_id=message.correlation_id,
+            reply_to=message.reply_to,
+            message_id=message.message_id or f"msg-{datetime.utcnow().isoformat()}",
+            timestamp=message.timestamp,
+            expiration=int(delay_ms),
+        )
+
+        retry_message = self.tracer.add_trace_context_to_message(retry_message, retry_span)
 
         await self.retry_exchange.publish(
-            aio_pika.Message(
-                body=message.body,
-                headers=headers,
-                delivery_mode=pabc.DeliveryMode.PERSISTENT,
-                content_type=message.content_type,
-                content_encoding=message.content_encoding,
-                correlation_id=message.correlation_id,
-                reply_to=message.reply_to,
-                message_id=message.message_id or f"msg-{datetime.utcnow().isoformat()}",
-                timestamp=message.timestamp,
-                expiration=int(delay_ms),
-            ),
+            retry_message,
             routing_key=f"{self.routing_key}.retry",
         )
+        self.tracer.end_span(retry_span)
         print(f"Message scheduled for retry #{retry_count + 1} with {delay_seconds}s delay")
 
     def _safe_int_conversion(self, value: Any, default: int = 0) -> int:
@@ -204,36 +233,54 @@ class GracefullConsumer:
         Soon after the worker dies all unacknowledged messages
         will be redelivered.
         """
+        traceparent = self.tracer.get_trace_context_from_message(message)
+        main_span = self.tracer.start_span("consume_message", traceparent)
         self.in_flight_messages += 1
         try:
             headers = message.headers or {}
             retry_count_value = headers.get("x-retry-count", 0)
             retry_count = self._safe_int_conversion(retry_count_value)
+            main_span.add_attribute("attempt", retry_count + 1)
+            main_span.add_attribute("routing_key", self.routing_key)
+            main_span.add_attribute("message_id", message.message_id)
             print(f"Processing message (attempt #{retry_count + 1}/{self.max_retries + 1})")
-
+            process_span = self.tracer.start_span(
+                "process_message",
+                incoming_traceparent=self.tracer.create_traceparent(
+                    main_span.trace_id, main_span.span_id
+                ),
+            )
             if random.random() > 0.3:
                 await asyncio.sleep(5)
+                process_span.add_attribute("result", "success")
+                self.tracer.end_span(process_span)
                 print("Successfully processed")
                 await message.ack()
             else:
                 raise Exception("Processing failed")
 
-        except Exception:
+        except Exception as e:
+            if "process_span" in locals():
+                process_span.add_attribute("error", str(e))
+                self.tracer.end_span(process_span)
+
+            main_span.add_attribute("error", str(e))
             headers = message.headers or {}
             retry_count = self._safe_int_conversion(headers.get("x-retry-count", 0))
 
             if retry_count < self.max_retries:
-                await self.retry_message(message, retry_count)
+                await self.retry_message(message, retry_count, main_span)
                 await message.ack()
                 print(f"Retry scheduled ({retry_count + 1}/{self.max_retries})")
             else:
                 await self.send_to_dlq(
-                    message, f"Max retries ({self.max_retries}) exceeded", retry_count
+                    message, f"Max retries ({self.max_retries}) exceeded", retry_count, main_span
                 )
                 await message.ack()
                 print("Max retries exceeded, sent to DLQ")
 
         finally:
+            self.tracer.end_span(main_span)
             self.in_flight_messages -= 1
 
     async def shutdown(self):
@@ -249,6 +296,9 @@ class GracefullConsumer:
 
         if self.in_flight_messages > 0:
             print(f"Warning: {self.in_flight_messages} messages still in flight")
+
+        for span in self.tracer.spans:
+            print(f"  {span.name}: {span.duration_ms():.2f}ms (trace: {span.trace_id[:8]}...)")
 
         if self.channel:
             await self.channel.close()
